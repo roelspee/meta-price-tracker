@@ -29,7 +29,7 @@ from typing import Optional
 # ─────────────────────────────────────────────
 
 TICKER                 = "META"
-ALERT_BELOW            = 600.00
+ALERT_BELOW            = 700.00
 CHECK_INTERVAL_SECONDS = 60
 LOG_FILE               = "meta_price_log.csv"
 ALERT_COOLDOWN_SECONDS = 3600   # 1 hour between emails
