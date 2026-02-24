@@ -22,6 +22,7 @@ import requests
 import anthropic
 from datetime import datetime
 from typing import Optional
+import pytz
 
 
 # ─────────────────────────────────────────────
@@ -29,8 +30,8 @@ from typing import Optional
 # ─────────────────────────────────────────────
 
 TICKER                 = "META"
-ALERT_BELOW            = 700.00
-CHECK_INTERVAL_SECONDS = 60
+ALERT_BELOW            = 600.00
+RUN_HOUR_CET = 8  # Run every day at 8am CET
 LOG_FILE               = "meta_price_log.csv"
 ALERT_COOLDOWN_SECONDS = 3600   # 1 hour between emails
 
@@ -80,6 +81,7 @@ def get_news(query: str, num_articles: int = 5) -> list:
                 "description": a.get("description", ""),
                 "source":      a.get("source", {}).get("name", ""),
                 "publishedAt": a.get("publishedAt", ""),
+                "url":         a.get("url", ""),
             })
         return articles
 
@@ -141,8 +143,8 @@ def send_smart_email(price: float, target: float, analysis: str, articles: list)
     news_section = ""
     if articles:
         news_section = "\nRECENT NEWS:\n"
-        for a in articles[:3]:
-            news_section += f"  • [{a['source']}] {a['title']}\n"
+        for a in articles[:5]:
+            news_section += f"  • [{a['source']}] {a['title']}\n    {a['url']}\n"
 
     body = f"""
 META Stock Price Alert
@@ -219,7 +221,7 @@ def run():
     print(f"  META Stock Price Tracker — AI Agent Mode")
     print(f"  Watching  : {TICKER}")
     print(f"  Alert if  : price drops BELOW ${ALERT_BELOW:.2f}")
-    print(f"  Interval  : every {CHECK_INTERVAL_SECONDS}s")
+    print(f"  Runs at   : {RUN_HOUR_CET}:00 CET every day")
     print(f"  Email to  : {EMAIL_RECEIVER}")
     print(f"  Cooldown  : {ALERT_COOLDOWN_SECONDS // 60} min between emails")
     print(f"  AI model  : claude-sonnet-4-6")
@@ -229,9 +231,28 @@ def run():
     print("  Press Ctrl+C to stop.\n")
 
     prev_price = None
-    last_alert_time = None
+
+    def seconds_until_next_run():
+        """Calculate seconds until next 8am CET."""
+        cet = pytz.timezone("Europe/Amsterdam")
+        now_cet = datetime.now(cet)
+        next_run = now_cet.replace(hour=RUN_HOUR_CET, minute=0, second=0, microsecond=0)
+        if now_cet >= next_run:
+            next_run = next_run.replace(day=next_run.day + 1)
+        delta = (next_run - now_cet).total_seconds()
+        return int(delta), next_run.strftime("%Y-%m-%d %H:%M:%S %Z")
 
     while True:
+        # Wait until 8am CET
+        secs, next_run_str = seconds_until_next_run()
+        print(f"  ⏰ Next check at {next_run_str} (in {secs // 3600}h {(secs % 3600) // 60}m)")
+        try:
+            time.sleep(secs)
+        except KeyboardInterrupt:
+            print(f"\nStopped. Goodbye!")
+            break
+
+        # Run the check
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         price = get_price(TICKER)
 
@@ -243,43 +264,23 @@ def run():
             log_price(price)
 
             if price < ALERT_BELOW:
-                now = time.time()
-                cooldown_over = (
-                    last_alert_time is None or
-                    (now - last_alert_time) > ALERT_COOLDOWN_SECONDS
-                )
-                if cooldown_over:
-                    print(f"  ⚠️  Triggered! Fetching news and running AI analysis...")
+                print(f"  ⚠️  Triggered! Fetching news and running AI analysis...")
 
-                    # Step 1: Get news
-                    articles = get_news("META Facebook stock")
-                    print(f"  📰 Found {len(articles)} news articles")
+                articles = get_news("META Facebook stock")
+                print(f"  📰 Found {len(articles)} news articles")
 
-                    # Step 2: Ask Claude to reason about it
-                    print(f"  🤖 Asking Claude for analysis...")
-                    analysis = analyze_with_claude(price, ALERT_BELOW, articles)
-                    print(f"  ✅ Analysis complete")
+                print(f"  🤖 Asking Claude for analysis...")
+                analysis = analyze_with_claude(price, ALERT_BELOW, articles)
+                print(f"  ✅ Analysis complete")
 
-                    # Step 3: Send smart email
-                    success = send_smart_email(price, ALERT_BELOW, analysis, articles)
-                    if success:
-                        last_alert_time = now
-                else:
-                    remaining = int(ALERT_COOLDOWN_SECONDS - (now - last_alert_time))
-                    print(f"  ⏳ Cooldown active — next email in {remaining // 60}m {remaining % 60}s")
+                send_smart_email(price, ALERT_BELOW, analysis, articles)
+            else:
+                print(f"  ✅ Price above target — no alert needed today.")
 
             prev_price = price
 
         else:
-            print(f"[{timestamp}]  Could not retrieve price. Retrying...")
-
-        try:
-            time.sleep(CHECK_INTERVAL_SECONDS)
-        except KeyboardInterrupt:
-            print(f"\nStopped. Goodbye!")
-            if LOG_FILE and os.path.isfile(LOG_FILE):
-                print(f"Price history saved to: {LOG_FILE}")
-            break
+            print(f"[{timestamp}]  Could not retrieve price.")
 
 
 if __name__ == "__main__":
