@@ -32,7 +32,7 @@ from typing import Optional
 # ─────────────────────────────────────────────
 
 TICKER = "META"                     # Stock to track
-ALERT_BELOW = 600.00                # 🔔 Send email if price drops BELOW this
+ALERT_BELOW = 700.00                # 🔔 Send email if price drops BELOW this
 CHECK_INTERVAL_SECONDS = 60         # How often to check (seconds)
 LOG_FILE = "meta_price_log.csv"     # Set to None to disable logging
 
