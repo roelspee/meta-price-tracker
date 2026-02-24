@@ -1,26 +1,26 @@
 """
-META (Facebook) Stock Price Tracker Agent
-==========================================
-Monitors Meta's stock price and sends you an email alert
-when the price drops below your target.
-
-Usage:
-    python meta_price_tracker.py
+META (Facebook) Stock Price Tracker — AI Agent
+================================================
+Monitors Meta's stock price. When it drops below your target:
+  1. Fetches recent META news from NewsAPI
+  2. Asks Claude to reason about why the price dropped
+  3. Sends you a smart email with analysis, not just a price alert
 
 Requirements:
-    pip install yfinance
+    pip install -r requirements.txt
 
-Email Setup (Gmail):
-    1. Go to myaccount.google.com/security
-    2. Enable 2-Step Verification if not already on
-    3. Search "App Passwords" → create one for "Mail"
-    4. Paste the 16-character password into EMAIL_PASSWORD below
+Environment variables to set in Railway:
+    EMAIL_SENDER, EMAIL_PASSWORD, EMAIL_RECEIVER
+    ANTHROPIC_API_KEY
+    NEWS_API_KEY
 """
 
 import yfinance as yf
 import time
 import os
 import smtplib
+import requests
+import anthropic
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
@@ -28,28 +28,24 @@ from typing import Optional
 
 
 # ─────────────────────────────────────────────
-#  CONFIG — edit these before running
+#  CONFIG
 # ─────────────────────────────────────────────
 
-TICKER = "META"                     # Stock to track
-ALERT_BELOW = 700.00                # 🔔 Send email if price drops BELOW this
-CHECK_INTERVAL_SECONDS = 60         # How often to check (seconds)
-LOG_FILE = "meta_price_log.csv"     # Set to None to disable logging
+TICKER                 = "META"
+ALERT_BELOW            = 600.00
+CHECK_INTERVAL_SECONDS = 60
+LOG_FILE               = "meta_price_log.csv"
+ALERT_COOLDOWN_SECONDS = 3600   # 1 hour between emails
 
-# --- Email Settings ---
-# These are read from environment variables so your password is never in the code.
-# On Railway: set these in your project's "Variables" tab.
-# For local testing: you can temporarily paste values directly here instead.
-import os as _os
-EMAIL_SENDER   = _os.environ.get("EMAIL_SENDER", "you@gmail.com")
-EMAIL_PASSWORD = _os.environ.get("EMAIL_PASSWORD", "xxxx xxxx xxxx xxxx")
-EMAIL_RECEIVER = _os.environ.get("EMAIL_RECEIVER", "you@gmail.com")
-SMTP_HOST      = "smtp.gmail.com"
-SMTP_PORT      = 587
+# --- Credentials (set these as Railway environment variables) ---
+EMAIL_SENDER      = os.environ.get("EMAIL_SENDER",      "you@gmail.com")
+EMAIL_PASSWORD    = os.environ.get("EMAIL_PASSWORD",    "xxxx xxxx xxxx xxxx")
+EMAIL_RECEIVER    = os.environ.get("EMAIL_RECEIVER",    "you@gmail.com")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+NEWS_API_KEY      = os.environ.get("NEWS_API_KEY",      "")
 
-# Cooldown: wait this long before sending another alert email
-# Prevents inbox spam if price stays below threshold for a long time
-ALERT_COOLDOWN_SECONDS = 3600  # 1 hour
+SMTP_HOST = "smtp.gmail.com"
+SMTP_PORT = 587
 
 # ─────────────────────────────────────────────
 
@@ -65,23 +61,113 @@ def get_price(ticker: str) -> Optional[float]:
         return None
 
 
-def send_email_alert(price: float, target: float):
-    """Send an email alert when price drops below target."""
+def get_news(query: str, num_articles: int = 5) -> list:
+    """Fetch recent news headlines for a query using NewsAPI."""
+    try:
+        url = "https://newsapi.org/v2/everything"
+        params = {
+            "q": query,
+            "sortBy": "publishedAt",
+            "pageSize": num_articles,
+            "language": "en",
+            "apiKey": NEWS_API_KEY,
+        }
+        response = requests.get(url, params=params, timeout=10)
+        data = response.json()
+
+        if data.get("status") != "ok":
+            print(f"  [WARN] NewsAPI error: {data.get('message')}")
+            return []
+
+        articles = []
+        for a in data.get("articles", []):
+            articles.append({
+                "title":       a.get("title", ""),
+                "description": a.get("description", ""),
+                "source":      a.get("source", {}).get("name", ""),
+                "publishedAt": a.get("publishedAt", ""),
+            })
+        return articles
+
+    except Exception as e:
+        print(f"  [ERROR] Could not fetch news: {e}")
+        return []
+
+
+def analyze_with_claude(price: float, target: float, articles: list) -> str:
+    """Ask Claude to reason about the price drop and news."""
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+        # Format news for the prompt
+        if articles:
+            news_text = "\n".join([
+                f"- [{a['source']}] {a['title']}: {a['description']}"
+                for a in articles
+            ])
+        else:
+            news_text = "No recent news articles found."
+
+        prompt = f"""You are a financial analyst assistant. META's stock price has just dropped below a user's alert threshold.
+
+Price data:
+- Current price: ${price:.2f}
+- Alert threshold: ${target:.2f}
+- Drop below threshold: ${target - price:.2f} ({((target - price) / target * 100):.2f}%)
+
+Recent META news headlines:
+{news_text}
+
+Please provide a brief, clear analysis (3-5 sentences) covering:
+1. What might be causing this price drop based on the news
+2. Whether this looks like a short-term dip or something more significant
+3. What the investor should keep an eye on
+
+Be direct and practical. Do not give explicit buy/sell advice."""
+
+        message = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=400,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        return message.content[0].text
+
+    except Exception as e:
+        print(f"  [ERROR] Claude analysis failed: {e}")
+        return "AI analysis unavailable at this time."
+
+
+def send_smart_email(price: float, target: float, analysis: str, articles: list):
+    """Send a smart email with AI analysis and news."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    subject = f"🔴 META Alert: ${price:.2f} dropped below ${target:.2f}"
+    subject = f"🔴 META Alert: ${price:.2f} dropped below ${target:.2f} — AI Analysis Inside"
+
+    # Format news links
+    news_section = ""
+    if articles:
+        news_section = "\nRECENT NEWS:\n"
+        for a in articles[:3]:
+            news_section += f"  • [{a['source']}] {a['title']}\n"
 
     body = f"""
-Hi there,
-
-Your META (Facebook) stock price alert has been triggered.
+META Stock Price Alert
+══════════════════════════════════════
 
   Current Price : ${price:.2f}
   Your Target   : below ${target:.2f}
-  Below by      : ${target - price:.2f}  ({((target - price) / target * 100):.2f}%)
+  Below by      : ${target - price:.2f} ({((target - price) / target * 100):.2f}%)
   Time          : {timestamp}
 
-This is an automated alert from your Meta Price Tracker.
-It won't send another alert for {ALERT_COOLDOWN_SECONDS // 60} minutes.
+──────────────────────────────────────
+AI ANALYSIS
+──────────────────────────────────────
+
+{analysis}
+{news_section}
+──────────────────────────────────────
+This is an automated alert from your META Price Tracker Agent.
+Next alert in {ALERT_COOLDOWN_SECONDS // 60} minutes if price stays below target.
 """
 
     try:
@@ -96,13 +182,11 @@ It won't send another alert for {ALERT_COOLDOWN_SECONDS // 60} minutes.
             server.login(EMAIL_SENDER, EMAIL_PASSWORD)
             server.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
 
-        print(f"  📧 Alert email sent to {EMAIL_RECEIVER}")
+        print(f"  📧 Smart alert email sent to {EMAIL_RECEIVER}")
         return True
 
     except smtplib.SMTPAuthenticationError:
-        print("  [ERROR] Email authentication failed.")
-        print("  → Use a Gmail App Password, not your regular password.")
-        print("  → Guide: myaccount.google.com → Security → App Passwords")
+        print("  [ERROR] Email authentication failed — check your Gmail App Password.")
         return False
     except Exception as e:
         print(f"  [ERROR] Failed to send email: {e}")
@@ -110,7 +194,7 @@ It won't send another alert for {ALERT_COOLDOWN_SECONDS // 60} minutes.
 
 
 def log_price(price: float):
-    """Append price + alert flag to CSV log file."""
+    """Append price to CSV log file."""
     if not LOG_FILE:
         return
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -133,12 +217,13 @@ def format_change(price: float, prev_price: Optional[float]) -> str:
 
 def run():
     print("=" * 54)
-    print(f"  META Stock Price Tracker — Email Alert Mode")
+    print(f"  META Stock Price Tracker — AI Agent Mode")
     print(f"  Watching  : {TICKER}")
     print(f"  Alert if  : price drops BELOW ${ALERT_BELOW:.2f}")
     print(f"  Interval  : every {CHECK_INTERVAL_SECONDS}s")
     print(f"  Email to  : {EMAIL_RECEIVER}")
     print(f"  Cooldown  : {ALERT_COOLDOWN_SECONDS // 60} min between emails")
+    print(f"  AI model  : claude-sonnet-4-6")
     if LOG_FILE:
         print(f"  Log file  : {LOG_FILE}")
     print("=" * 54)
@@ -158,7 +243,6 @@ def run():
 
             log_price(price)
 
-            # Send alert if below target and cooldown has passed
             if price < ALERT_BELOW:
                 now = time.time()
                 cooldown_over = (
@@ -166,8 +250,19 @@ def run():
                     (now - last_alert_time) > ALERT_COOLDOWN_SECONDS
                 )
                 if cooldown_over:
-                    print(f"  ⚠️  ${price:.2f} is below ${ALERT_BELOW:.2f} — sending alert email...")
-                    success = send_email_alert(price, ALERT_BELOW)
+                    print(f"  ⚠️  Triggered! Fetching news and running AI analysis...")
+
+                    # Step 1: Get news
+                    articles = get_news("META Facebook stock")
+                    print(f"  📰 Found {len(articles)} news articles")
+
+                    # Step 2: Ask Claude to reason about it
+                    print(f"  🤖 Asking Claude for analysis...")
+                    analysis = analyze_with_claude(price, ALERT_BELOW, articles)
+                    print(f"  ✅ Analysis complete")
+
+                    # Step 3: Send smart email
+                    success = send_smart_email(price, ALERT_BELOW, analysis, articles)
                     if success:
                         last_alert_time = now
                 else:
