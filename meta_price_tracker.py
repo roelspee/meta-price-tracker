@@ -10,7 +10,7 @@ Requirements:
     pip install -r requirements.txt
 
 Environment variables to set in Railway:
-    EMAIL_SENDER, EMAIL_PASSWORD, EMAIL_RECEIVER
+    EMAIL_SENDER, EMAIL_RECEIVER
     ANTHROPIC_API_KEY
     NEWS_API_KEY
 """
@@ -18,11 +18,8 @@ Environment variables to set in Railway:
 import yfinance as yf
 import time
 import os
-import smtplib
 import requests
 import anthropic
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 from typing import Optional
 
@@ -32,20 +29,17 @@ from typing import Optional
 # ─────────────────────────────────────────────
 
 TICKER                 = "META"
-ALERT_BELOW            = 800.00
+ALERT_BELOW            = 600.00
 CHECK_INTERVAL_SECONDS = 60
 LOG_FILE               = "meta_price_log.csv"
 ALERT_COOLDOWN_SECONDS = 3600   # 1 hour between emails
 
 # --- Credentials (set these as Railway environment variables) ---
 EMAIL_SENDER      = os.environ.get("EMAIL_SENDER",      "you@gmail.com")
-EMAIL_PASSWORD    = os.environ.get("EMAIL_PASSWORD",    "xxxx xxxx xxxx xxxx")
 EMAIL_RECEIVER    = os.environ.get("EMAIL_RECEIVER",    "you@gmail.com")
+SENDGRID_API_KEY  = os.environ.get("SENDGRID_API_KEY",  "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 NEWS_API_KEY      = os.environ.get("NEWS_API_KEY",      "")
-
-SMTP_HOST = "smtp.gmail.com"
-SMTP_PORT = 587
 
 # ─────────────────────────────────────────────
 
@@ -171,23 +165,28 @@ Next alert in {ALERT_COOLDOWN_SECONDS // 60} minutes if price stays below target
 """
 
     try:
-        msg = MIMEMultipart()
-        msg["From"] = EMAIL_SENDER
-        msg["To"] = EMAIL_RECEIVER
-        msg["Subject"] = subject
-        msg.attach(MIMEText(body, "plain"))
+        response = requests.post(
+            "https://api.sendgrid.com/v3/mail/send",
+            headers={
+                "Authorization": f"Bearer {SENDGRID_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "personalizations": [{"to": [{"email": EMAIL_RECEIVER}]}],
+                "from": {"email": EMAIL_SENDER},
+                "subject": subject,
+                "content": [{"type": "text/plain", "value": body}],
+            },
+            timeout=10
+        )
 
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-            server.starttls()
-            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-            server.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
+        if response.status_code == 202:
+            print(f"  📧 Smart alert email sent to {EMAIL_RECEIVER}")
+            return True
+        else:
+            print(f"  [ERROR] SendGrid error {response.status_code}: {response.text}")
+            return False
 
-        print(f"  📧 Smart alert email sent to {EMAIL_RECEIVER}")
-        return True
-
-    except smtplib.SMTPAuthenticationError:
-        print("  [ERROR] Email authentication failed — check your Gmail App Password.")
-        return False
     except Exception as e:
         print(f"  [ERROR] Failed to send email: {e}")
         return False
