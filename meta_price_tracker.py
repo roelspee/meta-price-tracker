@@ -10,8 +10,7 @@ On each run, for every stock in WATCHLIST:
   3. Exits
 
 Environment variables (set in Railway):
-    EMAIL_SENDER, EMAIL_RECEIVER
-    SENDGRID_API_KEY
+    RESEND_API_KEY
     ANTHROPIC_API_KEY
     NEWS_API_KEY
 """
@@ -21,6 +20,7 @@ import os
 import sys
 import requests
 import anthropic
+import resend
 from datetime import datetime
 from typing import Optional
 
@@ -40,32 +40,35 @@ WATCHLIST = [
     {"ticker": "AMZN",  "name": "Amazon",             "news_query": "Amazon AMZN stock"},
 ]
 
-ALERT_DROP_PCT = 0.05   # Alert when price is 5% below 60-day high
-ROLLING_DAYS   = 7     # Lookback window for the high
+ALERT_DROP_PCT = 0.05   # Alert when price is 5% below 7-day high
+ROLLING_DAYS   = 7      # Lookback window for the high
 
 LOG_FILE = "stock_price_log.csv"   # Set to None to disable
 
 # --- Credentials (Railway environment variables) ---
-EMAIL_SENDER      = os.environ.get("EMAIL_SENDER",      "you@gmail.com")
-EMAIL_RECEIVER    = os.environ.get("EMAIL_RECEIVER",    "you@gmail.com")
-SENDGRID_API_KEY  = os.environ.get("SENDGRID_API_KEY",  "")
+RESEND_API_KEY    = os.environ.get("RESEND_API_KEY", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 NEWS_API_KEY      = os.environ.get("NEWS_API_KEY",      "")
+
+EMAIL_SENDER      = "onboarding@resend.dev"
+EMAIL_RECEIVER    = "roelspee@protonmail.com"
+
+resend.api_key = RESEND_API_KEY
 
 # ─────────────────────────────────────────────
 
 
 def get_price_and_threshold(ticker: str) -> tuple[Optional[float], Optional[float], Optional[float]]:
-    """Fetch latest price, 60-day high, and dynamic alert threshold."""
+    """Fetch latest price, 7-day high, and dynamic alert threshold."""
     try:
         stock = yf.Ticker(ticker)
         price = round(stock.fast_info.last_price, 2)
         hist = stock.history(period=f"{ROLLING_DAYS}d")
         if hist.empty:
             return price, None, None
-        high_60d = round(float(hist["High"].max()), 2)
-        threshold = round(high_60d * (1 - ALERT_DROP_PCT), 2)
-        return price, high_60d, threshold
+        high_7d = round(float(hist["High"].max()), 2)
+        threshold = round(high_7d * (1 - ALERT_DROP_PCT), 2)
+        return price, high_7d, threshold
     except Exception as e:
         print(f"  [ERROR] Could not fetch data for {ticker}: {e}")
         return None, None, None
@@ -153,13 +156,9 @@ def markdown_to_html(text: str) -> str:
         line = line.strip()
         if not line:
             continue
-        # Strip ## / ### headings → bold paragraph
         line = re.sub(r'^#{1,3}\s+', '', line)
-        # Remove leading bullet chars
         line = re.sub(r'^[-*]\s+', '', line)
-        # **bold** → <strong>
         line = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', line)
-        # *italic* → <em>
         line = re.sub(r'\*(.+?)\*', r'<em>\1</em>', line)
         html_lines.append(f"<p style='margin:0 0 10px 0;'>{line}</p>")
     return "\n".join(html_lines)
@@ -186,8 +185,8 @@ def build_html_email(ticker: str, name: str, price: float, target: float, analys
 
     analysis_html = markdown_to_html(analysis)
 
-    high_60d = round(target / (1 - ALERT_DROP_PCT), 2)  # reverse-calculate for display
-    subject = f"🔴 {ticker} ${price:.2f} — 5% below 7-day high (${high_60d:.2f})"
+    high_7d = round(target / (1 - ALERT_DROP_PCT), 2)
+    subject = f"🔴 {ticker} ${price:.2f} — 5% below 7-day high (${high_7d:.2f})"
 
     html = f"""<!DOCTYPE html>
 <html>
@@ -218,7 +217,7 @@ def build_html_email(ticker: str, name: str, price: float, target: float, analys
                       <span style="font-size:36px; font-weight:800; color:#1a1a1a;">${price:.2f}</span>
                       <span style="color:#c0392b; font-size:15px; font-weight:600; margin-left:10px;">▼ ${drop_usd:.2f} ({drop_pct:.1f}%)</span>
                     </div>
-                    <div style="color:#888; font-size:13px; margin-top:4px;">Alert threshold: <strong>${target:.2f}</strong> &nbsp;·&nbsp; 7-day high: <strong>${high_60d:.2f}</strong></div>
+                    <div style="color:#888; font-size:13px; margin-top:4px;">Alert threshold: <strong>${target:.2f}</strong> &nbsp;·&nbsp; 7-day high: <strong>${high_7d:.2f}</strong></div>
                   </td>
                 </tr>
               </table>
@@ -259,48 +258,35 @@ def build_html_email(ticker: str, name: str, price: float, target: float, analys
 
 
 def send_smart_email(ticker: str, name: str, price: float, target: float, analysis: str, articles: list) -> bool:
-    """Send HTML alert email via SendGrid."""
+    """Send HTML alert email via Resend."""
     subject, html_body = build_html_email(ticker, name, price, target, analysis, articles)
 
     try:
-        response = requests.post(
-            "https://api.sendgrid.com/v3/mail/send",
-            headers={
-                "Authorization": f"Bearer {SENDGRID_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "personalizations": [{"to": [{"email": EMAIL_RECEIVER}]}],
-                "from": {"email": EMAIL_SENDER},
-                "subject": subject,
-                "content": [{"type": "text/html", "value": html_body}],
-            },
-            timeout=10
-        )
-
-        if response.status_code == 202:
-            print(f"  📧 Alert email sent to {EMAIL_RECEIVER}")
-            return True
-        else:
-            print(f"  [ERROR] SendGrid error {response.status_code}: {response.text}")
-            return False
+        r = resend.Emails.send({
+            "from": EMAIL_SENDER,
+            "to": EMAIL_RECEIVER,
+            "subject": subject,
+            "html": html_body,
+        })
+        print(f"  📧 Alert email sent to {EMAIL_RECEIVER} (id: {r['id']})")
+        return True
 
     except Exception as e:
         print(f"  [ERROR] Failed to send email: {e}")
         return False
 
 
-def log_price(ticker: str, price: float, high_60d: float, alert_below: float):
-    """Append price, 60d high, and threshold to CSV log file."""
+def log_price(ticker: str, price: float, high_7d: float, alert_below: float):
+    """Append price, 7d high, and threshold to CSV log file."""
     if not LOG_FILE:
         return
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     file_exists = os.path.isfile(LOG_FILE)
     with open(LOG_FILE, "a") as f:
         if not file_exists:
-            f.write("timestamp,ticker,price,60d_high,alert_below,triggered\n")
+            f.write("timestamp,ticker,price,7d_high,alert_below,triggered\n")
         triggered = "YES" if price < alert_below else ""
-        f.write(f"{timestamp},{ticker},{price},{high_60d},{alert_below},{triggered}\n")
+        f.write(f"{timestamp},{ticker},{price},{high_7d},{alert_below},{triggered}\n")
 
 
 def main():
@@ -315,20 +301,20 @@ def main():
         name       = stock["name"]
         news_query = stock["news_query"]
 
-        price, high_60d, alert_below = get_price_and_threshold(ticker)
+        price, high_7d, alert_below = get_price_and_threshold(ticker)
 
         if price is None:
             print(f"  {ticker}: ⚠️  Could not retrieve price, skipping.")
             continue
 
         if alert_below is None:
-            print(f"  {ticker}: ⚠️  Could not calculate 60d high, skipping.")
+            print(f"  {ticker}: ⚠️  Could not calculate 7d high, skipping.")
             continue
 
         status = "🔴 BELOW TARGET" if price < alert_below else "✅ above target"
-        print(f"  {ticker}: ${price:.2f}  (60d high: ${high_60d:.2f} → alert: ${alert_below:.2f})  —  {status}")
+        print(f"  {ticker}: ${price:.2f}  (7d high: ${high_7d:.2f} → alert: ${alert_below:.2f})  —  {status}")
 
-        log_price(ticker, price, high_60d, alert_below)
+        log_price(ticker, price, high_7d, alert_below)
 
         if price < alert_below:
             triggered_count += 1
