@@ -1,5 +1,5 @@
 """
-Tech Stock Price Tracker — AI Agent (Railway Cron Job)
+Tech Stock Price Tracker — AI Agent (Railway Cron Job) 
 =======================================================
 Runs once per invocation — triggered by Railway's Cron Job service.
 Recommended schedule: 0 7 * * *  (8am CET / UTC+1)
